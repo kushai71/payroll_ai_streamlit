@@ -465,53 +465,68 @@ def parse_structured_pdf_data(pdf_text):
     return pd.DataFrame(columns=['Date', 'Description', 'Amount'])
 
 def standardize_dataframe_columns(df):
-    # Create a mapping from normalized original column names to target standard names
-    standard_column_names = {
+    """
+    Standardizes column names to 'date', 'description', 'amount'.
+    Combines 'debit' and 'credit' into 'amount', handling signs appropriately.
+    Ensures 'amount' column is numeric.
+    """
+    df.columns = df.columns.str.lower()
+    
+    # Create a mapping from common variations to target standard names
+    column_mapping = {
+        'transaction date': 'date',
         'date': 'date',
-        'transactiondate': 'date',
-        'postingdate': 'date',
-        'processeddate': 'date',
+        'effective date': 'date',
+        'posted date': 'date',
         'description': 'description',
-        'transactiondescription': 'description',
-        'details': 'description',
+        'transaction description': 'description',
         'memo': 'description',
+        'payee': 'description',
         'amount': 'amount',
         'debit': 'debit',
         'credit': 'credit',
-        'withdrawal': 'debit',
-        'deposit': 'credit'
     }
 
-    # Rename columns based on the mapping
-    renamed_columns = {}
+    renamed_cols = {}
     for col in df.columns:
-        # Use re.sub for regex replacement on a string
-        normalized_col = re.sub(r'[^a-z0-9]+', '', col.strip().lower())
-        if normalized_col in standard_column_names:
-            renamed_columns[col] = standard_column_names[normalized_col]
-        else:
-            renamed_columns[col] = col
-
-    df.rename(columns=renamed_columns, inplace=True)
+        for key, value in column_mapping.items():
+            if key in col: # Use 'in' for more flexible matching
+                renamed_cols[col] = value
+                break
     
-    # Convert all column names to lowercase
-    df.columns = df.columns.str.lower()
+    df = df.rename(columns=renamed_cols)
 
-    # Process amount column only once
+    # Combine debit and credit into a single 'amount' column
     if 'debit' in df.columns and 'credit' in df.columns:
-        df['debit'] = pd.to_numeric(df['debit'], errors='coerce').fillna(0)
-        df['credit'] = pd.to_numeric(df['credit'], errors='coerce').fillna(0)
-        df['amount'] = df['credit'] - df['debit']
-        df.drop(columns=['debit', 'credit'], inplace=True)
+        # For 'debit', amounts are typically positive, represent as negative expenses
+        # For 'credit', amounts are typically positive, represent as positive revenue/income
+        df['amount'] = df.apply(lambda row: -row['debit'] if pd.notna(row['debit']) else row['credit'], axis=1)
+        df = df.drop(columns=['debit', 'credit'])
     elif 'debit' in df.columns and 'amount' not in df.columns:
-        df['amount'] = -pd.to_numeric(df['debit'], errors='coerce').fillna(0)
-        df.drop(columns=['debit'], inplace=True)
+        df['amount'] = -df['debit'] # If only debit exists, assume it's an expense
+        df = df.drop(columns=['debit'])
     elif 'credit' in df.columns and 'amount' not in df.columns:
-        df['amount'] = pd.to_numeric(df['credit'], errors='coerce').fillna(0)
-        df.drop(columns=['credit'], inplace=True)
-    elif 'amount' in df.columns:
-        # Ensure amount is numeric
-        df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
+        df['amount'] = df['credit'] # If only credit exists, assume it's income
+        df = df.drop(columns=['credit'])
+
+    # Ensure 'amount' is numeric, coercing errors to NaN
+    if 'amount' in df.columns:
+        df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+        # Drop rows where 'amount' is NaN after conversion, as they are not valid transactions
+        df.dropna(subset=['amount'], inplace=True)
+    else:
+        raise ValueError("Standardized DataFrame must contain an 'amount' column.")
+
+    # Ensure 'description' column exists, fill with empty string if not found
+    if 'description' not in df.columns:
+        df['description'] = ""
+
+    # Ensure 'date' column exists and is datetime
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df.dropna(subset=['date'], inplace=True) # Drop rows where date couldn't be parsed
+    else:
+        raise ValueError("Standardized DataFrame must contain a 'date' column.")
 
     return df
 
@@ -667,36 +682,34 @@ def generate_pnl_statement(categorized_df):
     row_references = {}
     current_row_index = 0 # Starting from 0 for internal list tracking
 
-    # Iterate through the P&L structure to collect values and prepare for Excel writing
+    # First pass: collect all row references
+    for item in P_AND_L_STRUCTURE:
+        category_name = item["Category"]
+        # Convert category name to a valid placeholder name for formulas
+        placeholder_key = category_name.lower().replace(" ", "_").replace("-", "_").replace("&", "and").replace("(", "").replace(")", "").replace(".", "").replace("/", "_")
+        row_references[f"{placeholder_key}_row"] = current_row_index + 6 # +6 because Excel starts at row 6 after title/headers
+        current_row_index += 1
+
+    # Reset current_row_index for second pass
+    current_row_index = 0
+
+    # Second pass: generate actual data with formulas
     for item in P_AND_L_STRUCTURE:
         category_name = item["Category"]
         indent = " " * (item.get("Indent", 0) * 4) # 4 spaces per indent level
         display_category = f"{indent}{category_name}"
 
-        # Convert category name to a valid placeholder name for formulas
-        # This ensures keys in row_references match placeholders in formulas
-        placeholder_key = category_name.lower().replace(" ", "_").replace("-", "_").replace("&", "and").replace("(", "").replace(")", "").replace(".", "").replace("/", "_") # Add more replacements as needed
-        
-        # For calculated rows, store a placeholder for the row reference
         if item["Type"] == "Calculated":
-            row_references[f"{placeholder_key}_row"] = current_row_index + 6 # +6 because Excel starts at row 6 after title/headers
-            pnl_data.append({"Category": display_category, "Amount": item["Formula"]}) # Store formula string
+            # Format the formula with the collected row references
+            formula = item["Formula"].format(**row_references)
+            pnl_data.append({"Category": display_category, "Amount": f"={formula}"})
         elif item["Type"] == "Header":
             pnl_data.append({"Category": display_category, "Amount": ""})
-            row_references[f"{placeholder_key}_row"] = current_row_index + 6 # Store for potential reference even if it's a header
         elif item["Type"] == "Value":
             amount = get_category_sum(categorized_df, item["Map"], item.get("IsExpense", False))
             pnl_data.append({"Category": display_category, "Amount": amount})
-            row_references[f"{placeholder_key}_row"] = current_row_index + 6 # Store 1-based row index for Excel, +6 for offset
 
         current_row_index += 1
-    
-    # Now, fill in the row references into the formulas
-    for i, row_dict in enumerate(pnl_data):
-        if isinstance(row_dict["Amount"], str) and "{" in row_dict["Amount"]:
-            # Use the already populated row_references directly
-            formula = row_dict["Amount"].format(**row_references)
-            pnl_data[i]["Amount"] = '=' + formula # Prepend '=' to make it an Excel formula
 
     return pnl_data
 
@@ -757,7 +770,6 @@ def accounting_assistant_page():
             total_rows = len(df)
 
             for i, row in enumerate(df.itertuples(index=False), 1):
-                # Ensure column names are consistently lowercase after standardization
                 category = categorize_transaction(row.description, row.amount, row.check_number, learned_rules, journal_rules)
                 processed_transactions.append(row._asdict() | {'category': category})
                 my_bar.progress(i / total_rows, text=f"{progress_text} {i}/{total_rows}")
@@ -778,8 +790,7 @@ def accounting_assistant_page():
 
             # Download P&L as Excel
             output = io.BytesIO()
-            # Convert pnl_data_for_display (which is a list of dicts) to DataFrame for excel export
-            pnl_df_for_excel = pd.DataFrame(pnl_data_for_display)
+            # Use pnl_df_for_display directly for Excel export since it's already a DataFrame
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 worksheet = writer.book.add_worksheet('P&L Statement')
 
@@ -799,7 +810,7 @@ def accounting_assistant_page():
                 worksheet.hide_gridlines(2) # Hide all gridlines
 
                 # Write data
-                for row_num, row_data in enumerate(pnl_df_for_excel.itertuples(index=False), start=1):
+                for row_num, row_data in enumerate(pnl_df_for_display.itertuples(index=False), start=1):
                     category_cell = row_data[0]
                     amount_cell = row_data[1]
                     
