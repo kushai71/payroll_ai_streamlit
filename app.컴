@@ -1,0 +1,36 @@
+import streamlit as st
+import pandas as pd
+import os
+from io import BytesIO
+
+def process_sales_file(file):
+    if file:
+        try:
+            df = pd.read_excel(file)
+            # Ensure the processed DataFrame is stored in session state for other pages
+            st.session_state.sales_df = df
+
+        except Exception as e:
+            st.error(f"❌ Failed to process sales file: {e}")
+    else:
+        st.info("Please upload a sales report or import one from Gmail.")
+
+
+def generate_sales_excel_download(df, filename="Rosatis_Sales_Report.xlsx"):
+    """Generates an Excel file from the sales DataFrame for download/attachment.
+    This function can be called to save the processed sales data to an Excel file.
+    """
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Sales Data')
+    output.seek(0)
+
+    # Save to a specific path for attachment
+    file_path = os.path.join("downloads", filename)
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    with open(file_path, "wb") as f:
+        f.write(output.read())
+    return file_path
+
+elif page == "Financial Summary Email":
+    st.title("✉️ Financial Summary Email Generator") 
